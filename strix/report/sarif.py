@@ -40,6 +40,10 @@ Design notes:
   * Findings without safe locations still appear in the SARIF output,
     anchored to SECURITY.md and flagged via
     ``properties.synthetic_location`` rather than being dropped silently.
+  * Coverage rides in the same document as non-failing results (``kind`` of
+    ``pass`` / ``notApplicable`` / ``open``), and run completeness on
+    ``run.invocations``. Consumers that only want alerts filter on
+    ``kind == "fail"`` and are unaffected.
 """
 
 from __future__ import annotations
@@ -96,6 +100,99 @@ _SEVERITY_TO_SCORE = {
 }
 
 
+# CWE → STRIDE-leg mapping for SARIF rule tagging. Each finding's rule gets one
+# or more ``stride:<leg>`` tags (Spoofing / Tampering / Repudiation /
+# Information disclosure / Denial of service / Elevation of privilege) so
+# consumers — the GitHub code-scanning Security tab, ASPM dashboards, coverage
+# reports — can group and filter findings by threat-model leg. SARIF results
+# inherit their rule's tags via ``ruleId``, so tagging the rule is sufficient.
+#
+# Where a CWE plausibly spans multiple legs the dominant one is listed first.
+# Unmapped / no-CWE findings fall back to ``_DEFAULT_STRIDE_LEGS`` so every
+# finding carries at least one leg (no coverage gaps in downstream reports).
+_CWE_TO_STRIDE: dict[str, tuple[str, ...]] = {
+    # Spoofing — authentication / identity
+    "287": ("S",),  # Improper Authentication
+    "290": ("S",),  # Authentication Bypass by Spoofing
+    "294": ("S",),  # Authentication Bypass by Capture-replay
+    "306": ("S", "E"),  # Missing Authentication for Critical Function
+    "345": ("S", "T"),  # Insufficient Verification of Data Authenticity
+    "346": ("S",),  # Origin Validation Error
+    "352": ("T", "S"),  # Cross-Site Request Forgery
+    "384": ("S",),  # Session Fixation
+    "521": ("S",),  # Weak Password Requirements
+    "613": ("S",),  # Insufficient Session Expiration
+    "640": ("S",),  # Weak Password Recovery Mechanism
+    "259": ("S", "I"),  # Use of Hard-coded Password
+    "798": ("S", "I"),  # Use of Hard-coded Credentials
+    "1391": ("S",),  # Use of Weak Credentials
+    # Tampering — integrity
+    "20": ("T",),  # Improper Input Validation
+    "73": ("T", "I"),  # External Control of File Name or Path
+    "78": ("T", "E"),  # OS Command Injection
+    "79": ("T", "I"),  # Cross-Site Scripting
+    "89": ("T",),  # SQL Injection
+    "91": ("T",),  # XML Injection
+    "94": ("T", "E"),  # Code Injection
+    "434": ("T",),  # Unrestricted File Upload
+    "502": ("T", "E"),  # Deserialization of Untrusted Data
+    "915": ("E", "T"),  # Improperly Controlled Modification (Mass Assignment)
+    "918": ("T", "I"),  # Server-Side Request Forgery
+    "1336": ("T", "E"),  # Server-Side Template Injection
+    # Repudiation — audit / logging
+    "117": ("R",),  # Improper Output Neutralization for Logs
+    "223": ("R",),  # Omission of Security-relevant Information
+    "778": ("R",),  # Insufficient Logging
+    # Information disclosure — confidentiality
+    "200": ("I",),  # Exposure of Sensitive Information
+    "201": ("I",),  # Insertion of Sensitive Info into Sent Data
+    "209": ("I",),  # Generation of Error Message Containing Sensitive Info
+    "256": ("I",),  # Plaintext Storage of a Password
+    "311": ("I",),  # Missing Encryption of Sensitive Data
+    "319": ("I",),  # Cleartext Transmission of Sensitive Information
+    "327": ("I",),  # Use of a Broken or Risky Cryptographic Algorithm
+    "328": ("I",),  # Use of Weak Hash
+    "522": ("I",),  # Insufficiently Protected Credentials
+    "525": ("I",),  # Use of Web Browser Cache Containing Sensitive Info
+    "532": ("I",),  # Insertion of Sensitive Information into Log File
+    "538": ("I",),  # Insertion of Sensitive Info into Externally-Accessible File
+    "598": ("I",),  # Use of GET Request Method With Sensitive Query Strings
+    # Denial of service — availability
+    "400": ("D",),  # Uncontrolled Resource Consumption
+    "770": ("D",),  # Allocation of Resources Without Limits or Throttling
+    "1333": ("D",),  # Inefficient Regular Expression Complexity (ReDoS)
+    # Elevation of privilege — authorization
+    "269": ("E",),  # Improper Privilege Management
+    "284": ("E",),  # Improper Access Control
+    "285": ("E",),  # Improper Authorization
+    "639": ("E",),  # Authorization Bypass Through User-Controlled Key (IDOR/BOLA)
+    "732": ("E",),  # Incorrect Permission Assignment for Critical Resource
+    "862": ("E",),  # Missing Authorization
+    "863": ("E",),  # Incorrect Authorization
+    "1220": ("E",),  # Insufficient Granularity of Access Control
+    # Multi-leg
+    "22": ("T", "I"),  # Path Traversal — write/read arbitrary paths (T) + file disclosure (I)
+    "611": ("I", "T"),  # XML External Entity (XXE)
+}
+
+# Default for unmapped / no-CWE findings: tampering + information-disclosure is
+# the most-common shape for an unclassified bug (matches the fork's and
+# strix-triage's DEFAULT_STRIDE_LEGS convention).
+_DEFAULT_STRIDE_LEGS: tuple[str, ...] = ("T", "I")
+
+
+def _stride_legs_for_cwe(cwe: str | None) -> tuple[str, ...]:
+    """Map a CWE id (``CWE-306`` / ``306`` / ``cwe: 306``) to STRIDE legs.
+    Returns ``_DEFAULT_STRIDE_LEGS`` for no-CWE / unrecognised input so every
+    finding gets at least one leg tag."""
+    if not cwe:
+        return _DEFAULT_STRIDE_LEGS
+    digits = "".join(c for c in str(cwe) if c.isdigit())
+    if not digits:
+        return _DEFAULT_STRIDE_LEGS
+    return _CWE_TO_STRIDE.get(digits, _DEFAULT_STRIDE_LEGS)
+
+
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
@@ -106,6 +203,7 @@ def build_sarif_report(
     *,
     tool_version: str | None = None,
     repository_context: dict[str, Any] | None = None,
+    coverage: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Return a SARIF 2.1.0 document for findings.
 
@@ -115,6 +213,11 @@ def build_sarif_report(
     ``versionControlProvenance`` + ``automationDetails`` so code-scanning
     can bind alerts to the scanned commit; it is omitted for URL / IP
     (DAST) targets that have no repository.
+
+    ``coverage`` (optional) is the document from
+    :func:`strix.report.coverage.build_coverage_document`: its cleared
+    surfaces become non-failing results and its completeness caveats become
+    invocation notifications.
 
     Findings without safe source locations are anchored synthetically
     to SECURITY.md and flagged via ``properties.synthetic_location``.
@@ -154,6 +257,9 @@ def build_sarif_report(
             )
         )
 
+    if coverage:
+        _append_coverage(coverage, rules_by_id, rule_index_by_id, results)
+
     driver: dict[str, Any] = {
         "name": TOOL_NAME,
         "informationUri": TOOL_INFORMATION_URI,
@@ -166,6 +272,9 @@ def build_sarif_report(
         "tool": {"driver": driver},
         "results": results,
     }
+
+    if coverage:
+        run["invocations"] = [_coverage_invocation(coverage)]
 
     run_properties: dict[str, Any] = {}
     if synthetic_location_count:
@@ -199,6 +308,7 @@ def write_sarif_report(
     *,
     tool_version: str | None = None,
     repository_context: dict[str, Any] | None = None,
+    coverage: dict[str, Any] | None = None,
 ) -> None:
     """Write a SARIF report to disk, creating parent directories first.
 
@@ -211,6 +321,7 @@ def write_sarif_report(
         vulnerability_reports,
         tool_version=tool_version,
         repository_context=repository_context,
+        coverage=coverage,
     )
     tmp_path = output_path.with_name(f"{output_path.name}.{os.getpid()}.tmp")
     try:
@@ -228,6 +339,7 @@ def write_sarif(
     *,
     tool_version: str | None = None,
     repository_context: dict[str, Any] | None = None,
+    coverage: dict[str, Any] | None = None,
     filename: str = "findings.sarif",
 ) -> Path:
     """Write ``findings.sarif`` alongside existing outputs in ``run_dir``.
@@ -242,6 +354,7 @@ def write_sarif(
         reports,
         tool_version=tool_version,
         repository_context=repository_context,
+        coverage=coverage,
     )
     logger.info(
         "Wrote SARIF 2.1.0 report: %s (%d results)",
@@ -433,10 +546,19 @@ def _result_properties(
         "impact",
         "technical_analysis",
         "remediation_steps",
+        "counterevidence",
+        "confidence",
+        "confidence_rationale",
+        "severity_change_conditions",
+        "fix_verification",
     ):
         value = report.get(key)
         if value not in (None, ""):
             strix[key] = value
+
+    dependency_metadata = report.get("dependency_metadata")
+    if isinstance(dependency_metadata, dict) and dependency_metadata:
+        strix["dependency_metadata"] = dependency_metadata
 
     # SARIF is written for external upload (code-scanning / ASPM), so it must
     # NOT carry the weaponized exploit payload — that stays a local run
@@ -514,6 +636,115 @@ def _build_fixes(report: dict[str, Any]) -> list[dict[str, Any]] | None:
     if remediation:
         fix["description"] = {"text": remediation, "markdown": remediation}
     return [fix]
+
+
+# ---------------------------------------------------------------------------
+# Coverage
+# ---------------------------------------------------------------------------
+
+_COVERAGE_RULE_PREFIX = "strix-coverage"
+
+# ``reported`` is absent on purpose: those surfaces are already in ``results``
+# as ``fail`` findings.
+_OUTCOME_TO_KIND = {
+    "no_issue_found": "pass",
+    "ruled_out": "pass",
+    "not_applicable": "notApplicable",
+    "needs_follow_up": "open",
+}
+
+
+def _coverage_rule_id(risk_area: str) -> str:
+    slug = _slugify(risk_area) or "unspecified"
+    return f"{_COVERAGE_RULE_PREFIX}/{slug}"
+
+
+def _build_coverage_rule(rule_id: str, risk_area: str) -> dict[str, Any]:
+    description = f"Coverage of {risk_area} across the assessed attack surface."
+    return {
+        "id": rule_id,
+        "name": _rule_name(rule_id, risk_area),
+        "shortDescription": {"text": f"Coverage: {risk_area}"},
+        "fullDescription": {"text": description},
+        "defaultConfiguration": {"level": "none"},
+        "help": {"text": description, "markdown": description},
+        "properties": {"tags": ["coverage"]},
+    }
+
+
+def _build_coverage_result(
+    rule_id: str,
+    rule_index: int,
+    kind: str,
+    entry: dict[str, Any],
+) -> dict[str, Any]:
+    surface = _string_value(entry.get("surface")) or "unspecified surface"
+    risk_area = _string_value(entry.get("risk_area")) or "unspecified risk"
+    evidence = _string_value(entry.get("evidence"))
+    label = _string_value(entry.get("outcome_label")) or str(entry.get("outcome", ""))
+
+    message = f"{risk_area} — {label}: {surface}"
+    if evidence:
+        message = f"{message}\n\n{evidence}"
+
+    result: dict[str, Any] = {
+        "ruleId": rule_id,
+        "ruleIndex": rule_index,
+        "kind": kind,
+        # SARIF requires ``level: none`` for any result whose kind is not ``fail``.
+        "level": "none",
+        "message": {"text": message},
+        "locations": [{"logicalLocations": [{"fullyQualifiedName": surface}]}],
+        "properties": {
+            "strix": {
+                "coverage_outcome": entry.get("outcome", ""),
+                "risk_area": risk_area,
+                "surface": surface,
+                "recorded_by": entry.get("recorded_by", ""),
+                "source": entry.get("source", "agent_reported"),
+            }
+        },
+    }
+    return result
+
+
+def _append_coverage(
+    coverage: dict[str, Any],
+    rules_by_id: dict[str, dict[str, Any]],
+    rule_index_by_id: dict[str, int],
+    results: list[dict[str, Any]],
+) -> None:
+    entries = coverage.get("entries")
+    if not isinstance(entries, list):
+        return
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        kind = _OUTCOME_TO_KIND.get(str(entry.get("outcome", "")))
+        if kind is None:
+            continue
+        rule_id = _coverage_rule_id(str(entry.get("risk_area", "")))
+        if rule_id not in rules_by_id:
+            rule_index_by_id[rule_id] = len(rules_by_id)
+            rules_by_id[rule_id] = _build_coverage_rule(
+                rule_id, _string_value(entry.get("risk_area")) or "unspecified risk"
+            )
+        results.append(_build_coverage_result(rule_id, rule_index_by_id[rule_id], kind, entry))
+
+
+def _coverage_invocation(coverage: dict[str, Any]) -> dict[str, Any]:
+    """``executionSuccessful: false`` stops a truncated run reading as a clean one."""
+    completeness = coverage.get("completeness")
+    completeness = completeness if isinstance(completeness, dict) else {}
+    caveats = completeness.get("caveats")
+    caveats = caveats if isinstance(caveats, list) else []
+
+    invocation: dict[str, Any] = {"executionSuccessful": bool(completeness.get("complete", True))}
+    if caveats:
+        invocation["toolExecutionNotifications"] = [
+            {"level": "warning", "message": {"text": str(caveat)}} for caveat in caveats
+        ]
+    return invocation
 
 
 # ---------------------------------------------------------------------------
@@ -863,6 +1094,13 @@ def _rule_tags(rule_id: str, report: dict[str, Any]) -> list[str]:
     cve = _string_value(report.get("cve"))
     if cve and cve not in tags:
         tags.append(cve)
+    # STRIDE-leg tags from the CWE → STRIDE mapping. Always at least one (the
+    # default legs for unmapped/no-CWE findings) so downstream threat-model
+    # coverage reports have no gaps. Emitted as ``stride:S``, ``stride:T``, ...
+    for leg in _stride_legs_for_cwe(report.get("cwe")):
+        tag = f"stride:{leg}"
+        if tag not in tags:
+            tags.append(tag)
     return tags
 
 
